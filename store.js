@@ -15,7 +15,8 @@
     AUTH_SESSION: 'kmp_auth_session',
     LOGIN_ATTEMPTS: 'kmp_login_attempts',
     ADMIN_CREDENTIALS: 'kmp_admin_credentials',
-    SUPABASE_CONFIG: 'kmp_supabase_config'
+    SUPABASE_CONFIG: 'kmp_supabase_config',
+    PENDING_REGS: 'kmp_pending_regs'
   };
 
   // Skrip SQL Lengkap Siap Pakai untuk Supabase SQL Editor (Ramping: Profil, Pengurus, & Pendaftaran)
@@ -367,6 +368,34 @@ END $$;
       });
   }
 
+  // Antrean perubahan pendaftaran yang belum terkonfirmasi cloud: { id: 'upsert' | 'delete' }
+  function getPending() {
+    try { return JSON.parse(localStorage.getItem(KEYS.PENDING_REGS) || '{}'); } catch (_) { return {}; }
+  }
+  function setPending(p) { localStorage.setItem(KEYS.PENDING_REGS, JSON.stringify(p)); }
+
+  function notifyCloudError(message) {
+    try {
+      window.dispatchEvent(new CustomEvent('kmp_cloud_error', { detail: { message } }));
+    } catch (_) {}
+  }
+
+  function regToRow(r) {
+    return {
+      id: r.id,
+      ref_code: r.refCode,
+      full_name: r.fullName,
+      phone: r.phone,
+      rtrw: r.rtrw,
+      reason: r.reason,
+      date: r.date,
+      status: r.status,
+      notes: r.notes || ''
+    };
+  }
+
+  let _lastRegWrite = 0; // penanda: ada tulis lokal setelah fetch dimulai -> jangan timpa
+
   // Helper Template Pesan WhatsApp
   const Templates = {
     memberRegistration(regData) {
@@ -550,8 +579,8 @@ END $$;
     // ==================== DATABASE CONFIGURATION (SUPABASE) ====================
     getSupabaseConfig() {
       const DEFAULT_CONFIG = {
-        url: 'https://ldrpkcokeqadramodafr.supabase.co',
-        anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxkcnBrY29rZXFhZHJhbW9kYWZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwMDE4NzIsImV4cCI6MjEwODU3Nzg3Mn0.VHvlNBI5xTSCL0Hdppyqf6s-NUDskLuyEdUM8LM0qgo',
+        url: 'https://zjpwjgbalmsjhcshrowh.supabase.co',
+        anonKey: 'sb_publishable_bnzh2eOVecYDMYift0v3kg_rZUK9Vzi',
         isEnabled: true
       };
 
@@ -641,8 +670,13 @@ END $$;
       const board = this.getBoard();
       const registrations = this.getRegistrations();
 
+      const must = async (q, label) => {
+        const { error } = await q;
+        if (error) throw new Error(`${label}: ${error.message}`);
+      };
+
       // 1. Profil & Gambar CMS
-      await client.from('kmp_profile').upsert({
+      await must(client.from('kmp_profile').upsert({
         id: 1,
         name: profile.name,
         short_name: profile.shortName,
@@ -664,11 +698,11 @@ END $$;
         stats: profile.stats || {},
         mission: profile.mission || [],
         values: profile.values || []
-      });
+      }), 'Profil');
 
       // 2. Pengurus
       if (board.length > 0) {
-        await client.from('kmp_board_members').upsert(board.map(b => ({
+        await must(client.from('kmp_board_members').upsert(board.map(b => ({
           id: b.id,
           name: b.name,
           position: b.position,
@@ -676,22 +710,13 @@ END $$;
           display_order: b.order || 1,
           bio: b.bio,
           photo: b.photo
-        })));
+        }))), 'Pengurus');
       }
 
       // 3. Registrasi
       if (registrations.length > 0) {
-        await client.from('kmp_registrations').upsert(registrations.map(r => ({
-          id: r.id,
-          ref_code: r.refCode,
-          full_name: r.fullName,
-          phone: r.phone,
-          rtrw: r.rtrw,
-          reason: r.reason,
-          date: r.date,
-          status: r.status,
-          notes: r.notes || ''
-        })));
+        await must(client.from('kmp_registrations').upsert(registrations.map(regToRow)), 'Pendaftaran');
+        setPending({});
       }
 
       return { success: true };
@@ -718,15 +743,27 @@ END $$;
       if (_syncPromise) return _syncPromise;
 
       const client = this.getSupabaseClient();
-      if (!client) return false;
+      if (!client) return { success: false, message: 'Supabase belum terhubung.' };
 
       _syncPromise = (async () => {
         try {
+          // Kirim dulu perubahan lokal yang belum sampai cloud, supaya tidak ditimpa data lama
+          await this.flushPending();
+          const startedAt = Date.now();
+
           const [pRes, bRes, rRes] = await Promise.all([
             client.from('kmp_profile').select('*').limit(1),
             client.from('kmp_board_members').select('*'),
             client.from('kmp_registrations').select('*')
           ]);
+
+          const fetchErr = [pRes, bRes, rRes].find(r => r.error);
+          if (fetchErr) {
+            const msg = fetchErr.error.message || String(fetchErr.error);
+            console.error('[Supabase Sync Error]:', fetchErr.error);
+            notifyCloudError(msg);
+            return { success: false, message: msg };
+          }
 
           let hasUpdated = false;
 
@@ -794,9 +831,11 @@ END $$;
           }
 
           // 3. Pendaftaran Anggota
-          if (rRes.data && rRes.data.length > 0) {
+          // Lewati jika user baru mengubah data selama fetch berjalan (hasil fetch sudah basi)
+          if (rRes.data && rRes.data.length > 0 && _lastRegWrite <= startedAt) {
+            const pending = getPending();
             const localRegs = this.getRegistrations();
-            const cloudRegs = rRes.data.map(r => ({
+            const cloudRegs = rRes.data.filter(r => !pending[r.id]).map(r => ({
               id: r.id,
               refCode: r.ref_code,
               fullName: r.full_name,
@@ -820,16 +859,49 @@ END $$;
               }));
             } catch (_) {}
           }
-          return true;
+          return { success: true, message: 'Data terbaru berhasil ditarik dari Supabase Cloud.' };
         } catch (err) {
           console.error('[Supabase Sync Error]:', err?.message || err, err);
-          return false;
+          return { success: false, message: err?.message || String(err) };
         } finally {
           _syncPromise = null;
         }
       })();
 
       return _syncPromise;
+    },
+
+    // Kirim satu perubahan pendaftaran ke cloud; tetap di antrean sampai cloud mengonfirmasi
+    async pushRegistration(id, op) {
+      const pending = getPending();
+      pending[id] = op;
+      setPending(pending);
+      _lastRegWrite = Date.now();
+
+      const client = this.getSupabaseClient();
+      if (!client || !this.isCloudEnabled()) return false;
+
+      let q;
+      if (op === 'delete') {
+        q = client.from('kmp_registrations').delete().eq('id', id);
+      } else {
+        const reg = this.getRegistrations().find(r => r.id === id);
+        if (!reg) { const p = getPending(); delete p[id]; setPending(p); return true; }
+        q = client.from('kmp_registrations').upsert(regToRow(reg));
+      }
+
+      const res = await executeCloudQuery(q, op === 'delete' ? 'Hapus Pendaftaran' : 'Simpan Pendaftaran');
+      if (res.success) {
+        const p = getPending(); delete p[id]; setPending(p);
+        return true;
+      }
+      notifyCloudError(res.error?.message || String(res.error));
+      return false;
+    },
+
+    async flushPending() {
+      const ids = Object.keys(getPending());
+      for (const id of ids) await this.pushRegistration(id, getPending()[id]);
     },
 
     // Reset ke Kondisi Pabrikan Default
@@ -1004,24 +1076,7 @@ END $$;
 
       list.unshift(newReg);
       localStorage.setItem(KEYS.REGISTRATIONS, JSON.stringify(list));
-
-      const client = this.getSupabaseClient();
-      if (client && this.isCloudEnabled()) {
-        executeCloudQuery(
-          client.from('kmp_registrations').upsert({
-            id: newReg.id,
-            ref_code: newReg.refCode,
-            full_name: newReg.fullName,
-            phone: newReg.phone,
-            rtrw: newReg.rtrw,
-            reason: newReg.reason,
-            date: newReg.date,
-            status: newReg.status,
-            notes: newReg.notes
-          }),
-          'Tambah Pendaftaran'
-        );
-      }
+      this.pushRegistration(newReg.id, 'upsert');
 
       return newReg;
     },
@@ -1032,25 +1087,7 @@ END $$;
       if (idx >= 0) {
         list[idx] = { ...list[idx], ...updateData };
         localStorage.setItem(KEYS.REGISTRATIONS, JSON.stringify(list));
-
-        const client = this.getSupabaseClient();
-        if (client && this.isCloudEnabled()) {
-          const reg = list[idx];
-          executeCloudQuery(
-            client.from('kmp_registrations').upsert({
-              id: reg.id,
-              ref_code: reg.refCode,
-              full_name: reg.fullName,
-              phone: reg.phone,
-              rtrw: reg.rtrw,
-              reason: reg.reason,
-              date: reg.date,
-              status: reg.status,
-              notes: reg.notes || ''
-            }),
-            'Perbarui Pendaftaran'
-          );
-        }
+        this.pushRegistration(id, 'upsert');
 
         return list[idx];
       }
@@ -1061,14 +1098,7 @@ END $$;
       let list = this.getRegistrations();
       list = list.filter(r => r.id !== id);
       localStorage.setItem(KEYS.REGISTRATIONS, JSON.stringify(list));
-
-      const client = this.getSupabaseClient();
-      if (client && this.isCloudEnabled()) {
-        executeCloudQuery(
-          client.from('kmp_registrations').delete().eq('id', id),
-          'Hapus Pendaftaran'
-        );
-      }
+      this.pushRegistration(id, 'delete');
 
       return list;
     },
