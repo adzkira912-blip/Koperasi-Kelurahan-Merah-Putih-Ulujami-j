@@ -86,6 +86,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Terapkan Logo & Skala Responsif
     const logoSrc = profile.logoUrl && profile.logoUrl.trim() !== '' ? profile.logoUrl : Store.DEFAULT_LOGO_SVG;
     elements.brandLogos.forEach(img => {
+      img.onerror = () => { img.onerror = null; img.src = Store.DEFAULT_LOGO_SVG; };
       img.src = logoSrc;
       img.alt = profile.name;
       if (img.closest('.site-header')) {

@@ -778,7 +778,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ==================== MODUL 5: DATABASE CLOUD (SUPABASE) ====================
   function renderDatabase() {
     const cfg = Store.getSupabaseConfig();
-    const isReady = Store.isSupabaseReady();
+    const isReady = Store.isCloudEnabled();
 
     if (elements.cfgSupabaseUrl) elements.cfgSupabaseUrl.value = cfg.url || '';
     if (elements.cfgSupabaseAnonKey) elements.cfgSupabaseAnonKey.value = cfg.anonKey || '';
@@ -961,6 +961,11 @@ document.addEventListener('DOMContentLoaded', () => {
     renderSettings();
     renderDatabase();
     setupRealtimeListener();
+  });
+
+  // Tampilkan error tulis/baca cloud (sebelumnya hanya masuk console)
+  window.addEventListener('kmp_cloud_error', (e) => {
+    showToast(`Cloud gagal: ${e.detail?.message || 'tidak diketahui'}. Perubahan tersimpan lokal & akan dicoba lagi.`, 'warning');
   });
 
   // Dengarkan event sinkronisasi data cloud
